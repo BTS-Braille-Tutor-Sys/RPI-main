@@ -148,8 +148,7 @@ def clean_json_text(text):
     """AI 응답 텍스트에서 마크다운 코드 블록 제거 후 순수 JSON만 추출합니다."""
     text = text.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\s*
-```$', '', text)
+    text = re.sub(r'\s*```$', '', text)
     return text.strip()
 
 
