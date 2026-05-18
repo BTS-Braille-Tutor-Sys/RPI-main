@@ -8,137 +8,168 @@ from machine import Pin, PWM
 # --- 하드웨어 핀 설정 ---
 
 # 1. 스텝 모터 핀 설정 (TMC2209)
-DIR_PIN = 12 # 방향 제어 핀
-STEP_PIN = 11 # 스텝 제어 핀
-EN_PIN = 22 # 모터 활성화 핀 (0: 활성화, 1: 비활성화)
+DIR_PIN = 12
+STEP_PIN = 11
+EN_PIN = 22
 
-direction = Pin(DIR_PIN, Pin.OUT) # 방향 제어 핀 설정
-step = Pin(STEP_PIN, Pin.OUT) # 스텝 제어 핀 설정
-enable = Pin(EN_PIN, Pin.OUT) # 모터 활성화 핀 설정
+direction = Pin(DIR_PIN, Pin.OUT)
+step = Pin(STEP_PIN, Pin.OUT)
+enable = Pin(EN_PIN, Pin.OUT)
 enable.value(1)  # 초기 모터 비활성화
 
 # 2. 솔레노이드 핀 설정
-PWM_PIN = 15 # 솔레노이드 제어용 PWM 핀
-pwm = PWM(Pin(PWM_PIN)) # PWM 객체 생성
-pwm.freq(20000) # 20kHz로 설정 (인간이 들을 수 없는 주파수)
-sel_pins = [Pin(0, Pin.OUT), Pin(1, Pin.OUT), Pin(2, Pin.OUT)] # 솔레노이드 선택 핀 설정 (3개)
+PWM_PIN = 15
+pwm = PWM(Pin(PWM_PIN))
+pwm.freq(20000)
+sel_pins = [Pin(0, Pin.OUT), Pin(1, Pin.OUT), Pin(2, Pin.OUT)]
 
 # 3. 호밍용 리미트 스위치 핀 설정
-LIMIT_PIN = 16 # 리미트 스위치 핀 (접촉 시 LOW, 비접촉 시 HIGH)
-limit_switch = Pin(LIMIT_PIN, Pin.IN, Pin.PULL_UP) # 내부 풀업 저항 사용
+LIMIT_PIN = 16
+limit_switch = Pin(LIMIT_PIN, Pin.IN, Pin.PULL_UP)
 
-def get_duty(percent): # 0~100%를 16비트 PWM 값(0~65535)으로 변환하는 함수
+def get_duty(percent):
     return int(percent * 65535 / 100)
 
-def move_stepper(steps, delay_us=15, clockwise=True): # 스텝 모터를 지정된 스텝 수만큼 이동시키는 함수
-    direction.value(1 if clockwise else 0) # 방향 설정 (1: 시계방향, 0: 반시계방향)
-    for _ in range(steps): # 지정된 스텝 수만큼 반복
-        step.value(1) # 스텝 핀 HIGH
-        time.sleep_us(delay_us) # 지정된 딜레이만큼 대기
-        step.value(0) # 스텝 핀 LOW
-        time.sleep_us(delay_us) # 지정된 딜레이만큼 대기
+def move_stepper(steps, delay_us=15, clockwise=True):
+    # clockwise=True(정방향: 1), clockwise=False(역방향: 0)
+    direction.value(1 if clockwise else 0)
+    for _ in range(steps):
+        step.value(1)
+        time.sleep_us(delay_us)
+        step.value(0)
+        time.sleep_us(delay_us)
 
 # --- 호밍(Homing) 함수 ---
-def homing(): # 모터를 리미트 스위치까지 이동시켜 초기 위치를 설정하는 함수
-    print("\n[호밍 시작] 리미트 스위치를 찾습니다...")
-    enable.value(0) # 모터 활성화
-    time.sleep(0.1) # 모터 활성화 후 잠시 대기
+def homing():
+    enable.value(0)
+    time.sleep(0.1)
     
-    homing_clockwise = False # 호밍 방향 설정 (필요에 따라 True/False 변경)
-    direction.value(1 if homing_clockwise else 0) # 호밍 방향 설정
+    homing_clockwise = False 
+    direction.value(1 if homing_clockwise else 0)
     
-    while limit_switch.value() == 1: # 리미트 스위치가 접촉될 때까지 반복 (접촉 시 LOW)
+    while limit_switch.value() == 1:
         step.value(1)
         time.sleep_us(30)
         step.value(0)
         time.sleep_us(30)
         
-    print("[호밍 감지] 스위치 접촉.")
+    time.sleep(0.5)
     
-    print("스위치 해제를 위해 아주 조금(200스텝) 뒤로 이동합니다...")
     direction.value(0 if homing_clockwise else 1)
     for _ in range(200): 
         step.value(1)
         time.sleep_us(30)
         step.value(0)
         time.sleep_us(30)
-        
-    print("[호밍 완료]\n")
 
+def actuate_solenoids(bits):
+    for i in range(3):
+        sel_pins[i].value(int(bits[i]))
 
-def actuate_solenoids(bits): # 솔레노이드 작동 함수 (bits는 3자리 문자열, 예: "101")
-    for i in range(3): # 3개의 솔레노이드 선택 핀에 각각 bits의 값을 설정 (1: 작동, 0: 비작동)
-        sel_pins[i].value(int(bits[i])) # 선택 핀 설정
+    if "1" in bits:
+        pwm.duty_u16(get_duty(100))
+        time.sleep(0.2)
+        pwm.duty_u16(get_duty(74))
+        time.sleep(0.5)
+    else:
+        time.sleep(0.2)
 
-    if "1" in bits: # bits에 '1'이 하나라도 있으면 솔레노이드 작동 (PWM 신호 출력)
-        pwm.duty_u16(get_duty(100)) # 100% 듀티 사이클로 솔레노이드 작동
-        time.sleep(0.2) # 솔레노이드가 완전히 작동할 때까지 잠시 대기
-        pwm.duty_u16(get_duty(74)) # 74% 듀티 사이클로 유지 (최소한의 전력으로 유지)
-        time.sleep(0.5) # 솔레노이드가 유지되는 동안 잠시 대기
-    else: # bits가 모두 '0'이면 솔레노이드 비작동 (PWM 신호 끔)
-        time.sleep(0.2) # 잠시 대기 후 바로 끔 (작동이 필요 없으므로)
-
-    pwm.duty_u16(0) # PWM 신호 끔 (솔레노이드 완전히 비작동)
-    for p in sel_pins: # 선택 핀 모두 LOW로 설정 (솔레노이드 선택 해제)
+    pwm.duty_u16(0)
+    for p in sel_pins:
         p.value(0)
     time.sleep(0.1)
 
-def run_sequence(s1, s2, pattern): # 시퀀스 실행 함수 (s1, s2는 모터 이동 스텝 수, pattern은 솔레노이드 작동 패턴 문자열)
+# --- 정방향 시퀀스 (핀 올리기) ---
+def run_sequence_forward(s1, s2, pattern):
     enable.value(0)
     time.sleep(0.1)
     
-    chunks = [pattern[i:i+3] for i in range(0, len(pattern), 3)] # 패턴을 3자리씩 나누어 리스트로 저장 (예: "101010" -> ["101", "010"])
-    total_chunks = len(chunks) # 총 시퀀스 수 계산
+    chunks = [pattern[i:i+3] for i in range(0, len(pattern), 3)]
+    total_chunks = len(chunks)
     
-    for idx, chunk in enumerate(chunks): # 각 시퀀스에 대해 반복 (idx는 현재 시퀀스 인덱스, chunk는 현재 시퀀스 패턴)
-        print(f"\n--- [시퀀스 {idx+1}/{total_chunks}] ---")
+    for idx, chunk in enumerate(chunks):
+        # 1. 솔레노이드 작동
+        actuate_solenoids(chunk)
         
-        # 1. 솔레노이드 작동 (먼저 실행)
-        print(f"1. 솔레노이드 작동 패턴 '{chunk}'")
-        actuate_solenoids(chunk) # 해당 시퀀스의 솔레노이드 작동 패턴에 따라 솔레노이드 작동 함수 호출
+        # 2. 모터 정방향 이동
+        if idx != total_chunks - 1: # 마지막 시퀀스가 아닐 때만 모터 이동
+            current_steps = s1 if idx % 2 == 0 else s2
+            move_stepper(steps=current_steps, clockwise=True)
+
+# --- 역방향 시퀀스 (핀 내리기) ---
+def run_sequence_reverse(s1, s2, pattern):
+    enable.value(0)
+    time.sleep(0.1)
+    
+    chunks = [pattern[i:i+3] for i in range(0, len(pattern), 3)]
+    total_chunks = len(chunks)
+    
+    # 끝 위치에서부터 거꾸로 순회
+    for idx in range(total_chunks - 1, -1, -1):
+        chunk = chunks[idx]
+        actuate_solenoids(chunk)
         
-        # 2. 모터 이동 (마지막 시퀀스인 경우 생략)
-        if idx == total_chunks - 1: # 마지막 시퀀스인 경우 모터 이동 생략
-            print("2. 마지막 시퀀스이므로 모터 이동을 생략합니다.")
-        else: # 마지막 시퀀스가 아닌 경우 모터 이동 실행
-            current_steps = s1 if idx % 2 == 0 else s2 # 짝수 시퀀스는 s1 스텝, 홀수 시퀀스는 s2 스텝으로 이동
-            print(f"2. 모터 이동: {current_steps} 스텝")
-            move_stepper(steps=current_steps)
-        
-    print("\n모든 동작이 완료되었습니다.")
+        # 시작 위치가 아닐 때만 모터 이동
+        if idx != 0:
+            prev_idx = idx - 1
+            current_steps = s1 if prev_idx % 2 == 0 else s2
+            move_stepper(steps=current_steps, clockwise=False)
 
 # --- 실행 부분 ---
 try:
     homing()
-    print("준비 완료! 라즈베리파이 5로부터 데이터를 기다립니다...")
     
-    # 시리얼 입력을 감시하는 폴러(Poller) 생성
     poller = select.poll()
     poller.register(sys.stdin, select.POLLIN)
     
+    previous_pattern = None 
+    s1_steps = 24528 
+    s2_steps = 40544
+    
     while True:
-        # 0.1초(100ms) 단위로 수신된 데이터가 있는지 '확인만' 함 (프로그램이 멈추지 않음)
         res = poller.poll(100) 
         
         if res:
-            # 데이터가 들어왔을 때만 읽어들임
             line = sys.stdin.readline().strip()
             
             if line:
-                print(f"수신된 패턴: {line}")
-                s1_steps = 24528 
-                s2_steps = 40544
-                run_sequence(s1_steps, s2_steps, line)
-                print("\n출력 완료. 다음 데이터를 기다립니다.")
+                if line.startswith('<') and line.endswith('>'):
+                    payload = line[1:-1]
+                    
+                    # --- 종료 패킷(<EXIT>) 처리 로직 ---
+                    if payload == "EXIT":
+                        # 이전에 올린 핀(패턴)이 있다면 역방향으로 내려줌
+                        if previous_pattern is not None:
+                            run_sequence_reverse(s1_steps, s2_steps, previous_pattern)
+                            homing()
+                            previous_pattern = None # 초기화
+                        
+                        print("<DONE>") # 파이5로 완료 신호 전송
+                        break # 메인 루프를 탈출하여 finally 블록(모터 비활성화)으로 이동
+                        
+                    # --- 기존 점자 패턴 처리 로직 ---
+                    else:
+                        current_pattern = payload
+                        
+                        # 1. 기존 핀 내리기 (되돌아가면서 역방향 실행)
+                        if previous_pattern is not None:
+                            run_sequence_reverse(s1_steps, s2_steps, previous_pattern)
+                            homing()
+                        
+                        # 2. 새로운 핀 올리기 (정방향 실행)
+                        run_sequence_forward(s1_steps, s2_steps, current_pattern)
+                        
+                        previous_pattern = current_pattern
+                        print("<DONE>")
+                        
         else:
-            # 데이터가 없으면 아주 짧게 쉬고 다시 확인 (무한 루프 유지)
             time.sleep(0.01)
 
 except KeyboardInterrupt:
-    print("\n사용자에 의해 강제 종료되었습니다.")
+    pass
 finally:
+    # 종료 패킷을 받아 break로 탈출하거나 예외가 발생하면 안전하게 모든 핀과 모터를 비활성화
     pwm.duty_u16(0)
     for p in sel_pins:
         p.value(0)
-    enable.value(1)
-    print("종료합니다.")
+    enable.value(1) # 모터 비활성화 (드라이버 설정에 따라 1이 Disable인 경우)
