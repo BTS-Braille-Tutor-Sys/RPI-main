@@ -1,5 +1,3 @@
-# pip install google-genai 이거 설치할 것
-
 import os
 import sys
 import time
@@ -31,7 +29,7 @@ class SuppressStderr:
     def __enter__(self):
         self.saved_stderr = os.dup(2)
         self.devnull = os.open(os.devnull, os.O_WRONLY)
-        self.dup2(self.devnull, 2)
+        os.dup2(self.devnull, 2)
     def __exit__(self, *args):
         os.dup2(self.saved_stderr, 2)
         os.close(self.devnull)
@@ -41,9 +39,10 @@ class SuppressStderr:
 # --- [설정 및 초기화] ---
 DEVICE_ID = 1      # [최적화] 파이 5 하드웨어 호환 마이크 장치 번호
 SAMPLE_RATE = 48000 # [최적화] 채널 충돌 방지 샘플 레이트 고정
-CSV_FILE = 'word_natural_2chars.csv'
+CSV_FILE = 'word.csv'
 
 # 최신 Gemini Client 객체 생성
+
 client = genai.Client()
 
 # 전역 상태 제어 변수
@@ -141,8 +140,7 @@ def clean_json_text(text):
     """AI 응답 텍스트에서 마크다운 태그를 제거하고 순수 JSON만 추출합니다."""
     text = text.strip()
     text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\s*
-```$', '', text)
+    text = re.sub(r'\s*```$', '', text)
     return text.strip()
 
 
