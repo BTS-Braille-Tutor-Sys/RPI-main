@@ -42,7 +42,6 @@ SAMPLE_RATE = 48000 # [최적화] 채널 충돌 방지 샘플 레이트 고정
 CSV_FILE = 'word.csv'
 
 # 최신 Gemini Client 객체 생성
-
 client = genai.Client()
 
 # 전역 상태 제어 변수
@@ -52,6 +51,7 @@ current_topic = None
 topic_idx = 0
 current_word_pool = []
 learned_words = set()  # 현재 주제에서 이미 학습한 단어 누적 (중복 방지)
+last_word = None       # [추가] 다시 듣기/보기(REPEAT) 기능용 최근 단어 저장
 
 def initialize_and_load_csv():
     """CSV 파일을 로드하고 메모리 내부 상태를 동기화합니다."""
@@ -110,7 +110,16 @@ def send_braille_to_pico(text):
         ser.write(packet.encode())
         
         print("[대기 중] 점자 기기 출력이 끝날 때까지 기다립니다...")
+        
+        # [수정] 무한 대기(Deadlock) 방지용 타임아웃 추가
+        start_time = time.time()
+        timeout_seconds = 7.0 
+        
         while True:
+            if time.time() - start_time > timeout_seconds:
+                print("[에러] 기기 응답 타임아웃 발생 (7초). 대기 상태를 해제합니다.")
+                break
+                
             if ser.in_waiting > 0:
                 received_data = ser.readline().decode('utf-8', errors='ignore').strip()
                 if received_data == "<DONE>":
@@ -136,14 +145,6 @@ def speak(text):
 
 
 # --- [AI 오퍼레이션 함수군] ---
-def clean_json_text(text):
-    """AI 응답 텍스트에서 마크다운 태그를 제거하고 순수 JSON만 추출합니다."""
-    text = text.strip()
-    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\s*```$', '', text)
-    return text.strip()
-
-
 def generate_words_for_new_theme(theme):
     """단어장에 없는 새로운 주제가 들어왔을 때 실존하는 2글자 이하의 단어를 자동 생성합니다."""
     print(f"[AI] '{theme}'은(는) 새로운 주제입니다. 실존 단어를 생성하는 중...")
@@ -156,39 +157,60 @@ def generate_words_for_new_theme(theme):
     1. 반드시 실제로 존재하는 명사 단어여야 해.
     2. 점자판 크기 제한으로 인해, 각 단어의 글자 수는 반드시 '최대 2글자(1글자 또는 2글자)'여야만 해. 3글자 이상은 절대 안 돼.
     3. 주제에 어울리는 대표적인 단어로 5개만 생성해줘.
-    4. 출력 형식은 설명 없이 오직 순수한 JSON 문자열 배열 형식으로만 답변해.
-       예시: ["사과", "배", "포도", "감", "귤"]
     """
     
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=f"주제: {theme}",
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json"
+    global df
+    # [수정] 기존 CSV 오염 방지: 중복 단어 필터링을 위한 기존 단어 풀 로드
+    existing_words = set(df['word'].dropna().tolist()) if df is not None and not df.empty else set()
+    
+    # [수정] 엄격한 구조화된 출력 (Structured Output) 스키마 정의
+    word_schema = types.Schema(
+        type=types.Type.ARRAY,
+        items=types.Schema(type=types.Type.STRING)
+    )
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=f"주제: {theme}",
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    response_schema=word_schema,
+                    temperature=0.7 # 다양한 단어 생성을 위한 온도 조절
+                )
             )
-        )
-        raw_text = clean_json_text(response.text)
-        new_words = json.loads(raw_text)
-        filtered_words = [w for w in new_words if len(w) <= 2]
-        
-        if filtered_words:
-            with open(CSV_FILE, mode='a', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f)
-                for word in filtered_words:
-                    writer.writerow([theme, word])
-            initialize_and_load_csv()
-            print(f"[시스템] CSV 업데이트 완료: '{theme}' 주제의 단어 {len(filtered_words)}개 추가.")
-        return filtered_words
-    except Exception as e:
-        print(f"[에러] 신규 단어 생성 실패: {e}")
-        return []
+            
+            new_words = json.loads(response.text)
+            
+            # [수정] LLM의 규칙 위반 시 필터링 및 중복 검증
+            filtered_words = [w for w in new_words if len(w) <= 2 and w not in existing_words]
+            filtered_words = list(dict.fromkeys(filtered_words)) # 리스트 내 자체 중복 제거
+            
+            if filtered_words:
+                with open(CSV_FILE, mode='a', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    for word in filtered_words:
+                        writer.writerow([theme, word])
+                initialize_and_load_csv()
+                print(f"[시스템] CSV 업데이트 완료: '{theme}' 주제의 단어 {len(filtered_words)}개 추가.")
+                return filtered_words
+            else:
+                print(f"[경고] {attempt + 1}차 시도: 유효하거나 새로운 단어가 부족합니다. 재시도합니다.")
+                
+        except Exception as e:
+            print(f"[에러] 신규 단어 생성 실패 ({attempt + 1}/{max_retries}): {e}")
+            time.sleep(1)
+            
+    print("[에러] 유효한 단어 생성에 실패했습니다.")
+    return []
 
 
 def output_next_word():
     """현재 지정된 데이터 풀 안에서 중복되지 않은 임의의 단어를 추출하여 기기로 전송합니다."""
-    global current_topic, current_word_pool
+    global current_topic, current_word_pool, last_word
     
     if not current_topic:
         speak("공부하고 싶은 주제를 말씀하시거나, 랜덤 주제라고 말씀해 주세요.")
@@ -206,6 +228,9 @@ def output_next_word():
     selected = random.choice(remaining_words)
     target_word = selected['word']
     learned_words.add(target_word)
+    
+    # [추가] 다시 듣기 기능을 위한 단어 저장
+    last_word = target_word
 
     speak(f"단어는 {target_word}입니다.")
     send_braille_to_pico(target_word)
@@ -228,7 +253,7 @@ def load_topic_by_name(theme_name):
 
 # --- [AI 지능형 의도 처리 엔진] ---
 def process_voice_with_llm(text):
-    global current_topic, current_word_pool, topic_idx, learned_words
+    global current_topic, current_word_pool, topic_idx, learned_words, last_word
     
     text = text.strip()
     if not text: return False
@@ -240,25 +265,39 @@ def process_voice_with_llm(text):
     if any(k in text.replace(" ", "") for k in exit_keywords):
         return "EXIT"
 
+    # [수정] REPEAT, UNKNOWN 액션에 대한 지침 세분화 및 자연스러운 응답 필드 추가
     system_instruction = f"""
-    너는 점자 학습기의 의도 분석기야. 사용자의 대화에서 의도(action)와 주제(theme)를 분석해줘.
+    너는 점자 학습기의 의도 분석기야. 사용자의 대화에서 의도(action)와 주제(theme), 자연스러운 응답(answer)을 분석해줘.
     
     1. action의 종류:
-       - START: 특정 주제로 학습을 시작하고 싶어할 때. (예: "날씨 공부하자", "가족 단어 보여줘", "축구", "아무거나 골라줘")
-       - STOP: 학습을 일시 중지하거나 대기 상태로 전환할 때 (예: "잠깐 멈춰줘", "주제 초기화", "처음으로")
-       - NEXT: 다음 단어로 넘어가고 싶어할 때 (예: "다음", "넘어가자", "맞췄어", "그 다음 단어")
-       - LIST: 현재 어떤 주제들이 등록되어 있는지 물어볼 때 (예: "카테고리 뭐 있어?", "등록된 주제 알려줘")
-       - UNKNOWN: 단순 감탄사나 학습기와 무관한 대화일 때
+       - START: 특정 주제로 학습을 시작 (예: "날씨 공부하자", "가족 단어 보여줘", "축구", "아무거나 골라줘")
+       - STOP: 학습 중지 (예: "잠깐 멈춰줘", "주제 초기화", "처음으로")
+       - NEXT: 다음 단어로 이동 (예: "다음", "넘어가자", "맞췄어")
+       - LIST: 주제 목록 질문 (예: "카테고리 뭐 있어?")
+       - REPEAT: 현재 단어를 다시 듣거나 점자 기기로 다시 출력하길 원할 때 (예: "다시", "한 번 더", "뭐였지?", "다시 보여줘")
+       - UNKNOWN: 위 의도에 해당하지 않는 일상 대화나 감탄사 (예: "오, 신기하다!", "재밌네", "너 이름이 뭐야?")
        
     2. theme 분류 및 매핑 규칙:
-       - 현재 시스템에 등록된 표준 주제 목록은 다음과 같아: {topic_list}
-       - 사용자가 "랜덤", "아무거나 해줘"라고 발화하면 반드시 theme를 'RANDOM'으로 지정해야 해.
-       - 사용자가 특정 단어(예: 축구, 농구)를 언급했으나, 표준 목록에 상위 카테고리(예: 운동)가 있다면 theme를 상위 카테고리인 '운동'으로 매핑해줘.
-       - 목록에 존재하지 않는 완전히 새로운 단어나 가치관일 때만 사용자가 입력한 핵심 단어 자체를 theme로 설정해.
+       - 현재 시스템 등록 표준 주제 목록: {topic_list}
+       - "랜덤", "아무거나 해줘" 발화 시 theme를 'RANDOM'으로 지정.
+       - 표준 목록에 상위 카테고리가 있다면 상위 카테고리로 매핑.
+       - 목록에 없는 새로운 주제일 때만 사용자가 입력한 단어 자체를 theme로 설정.
        
-    3. 출력 형식:
-       - 설명 없이 오직 JSON 형식으로만 답변해. 예시: {{"action": "START", "theme": "우주"}}
+    3. answer 작성 규칙:
+       - action이 UNKNOWN일 경우, 사용자의 말에 어울리는 짧고 자연스러운 맞장구나 안내 멘트를 `answer` 필드에 작성.
+       - 그 외 action일 경우 `answer`는 빈 문자열로 둬도 무방함.
     """
+    
+    # [수정] 의도 분석기 스키마 정의 (JSON 텍스트 정제 불필요)
+    intent_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "action": types.Schema(type=types.Type.STRING),
+            "theme": types.Schema(type=types.Type.STRING, nullable=True),
+            "answer": types.Schema(type=types.Type.STRING, nullable=True)
+        },
+        required=["action"]
+    )
 
     try:
         response = client.models.generate_content(
@@ -266,15 +305,17 @@ def process_voice_with_llm(text):
             contents=text,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                response_mime_type="application/json"
+                response_mime_type="application/json",
+                response_schema=intent_schema
             )
         )
-        raw_text = clean_json_text(response.text)
-        result = json.loads(raw_text)
+        
+        result = json.loads(response.text)
         action = result.get("action")
         theme = result.get("theme")
+        answer = result.get("answer")
         
-        print(f"[AI 분석 결과] 의도: {action} | 감지된 주제: {theme}")
+        print(f"[AI 분석 결과] 의도: {action} | 감지된 주제: {theme} | 생성된 응답: {answer}")
         
         if action == "START" and theme:
             if theme.upper() == "RANDOM":
@@ -311,6 +352,21 @@ def process_voice_with_llm(text):
                 speak(f"현재 선택 가능한 주제는 {', '.join(topic_list[:6])} 등이 있습니다.")
             return True
             
+        elif action == "REPEAT":
+            if last_word:
+                speak(f"다시 알려드릴게요. 단어는 {last_word}입니다.")
+                send_braille_to_pico(last_word)
+            else:
+                speak("이전에 출력한 단어가 없습니다. 새로운 주제를 시작해 주세요.")
+            return True
+            
+        elif action == "UNKNOWN":
+            if answer:
+                speak(answer)
+            else:
+                speak("잘 이해하지 못했습니다. 단어 학습을 이어서 진행하려면 다음 단어를 요청해 주세요.")
+            return True
+            
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
@@ -328,7 +384,6 @@ try:
     print(f"--- 지능형 점자 학습기 가동 준비 완료 (하드웨어 연결 최적화 모드) ---")
     speak("공부할 주제를 말씀하세요.")
     
-    # [인터페이스 고정] 장치 오픈을 루프 외부에서 실행하여 ALSA 드라이버 오버헤드 최소화
     with sr.Microphone(device_index=DEVICE_ID, sample_rate=SAMPLE_RATE) as source:
         r.adjust_for_ambient_noise(source, duration=1.0)
         
@@ -338,13 +393,10 @@ try:
                 with SuppressStderr():
                     audio = r.listen(source, timeout=10, phrase_time_limit=5)
 
-                # 구글 클라우드 STT 연동
                 text = r.recognize_google(audio, language='ko-KR')
                 
-                # AI 프레임워크 제어 전송
                 result = process_voice_with_llm(text)
                 
-                # 종료 신호가 로컬 혹은 AI단에서 반환되었을 때 기기 정지 패킷 전송
                 if result == "EXIT":
                     speak("학습을 종료합니다.")
                     if ser is not None:
@@ -355,9 +407,9 @@ try:
                     break
             
             except sr.WaitTimeoutError:
-                pass  # 타임아웃 발생 시 무음 유지 후 재대기
+                pass  
             except sr.UnknownValueError:
-                pass  # 인식 불가능한 오디오 노이즈 무시
+                pass  
             except sr.RequestError as e:
                 print(f"[네트워크 에러] 구글 STT 서버 연동 실패: {e}")
 
